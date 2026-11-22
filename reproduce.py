@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import statistics
 import sys
+import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent
@@ -59,11 +60,19 @@ def download_models(args):
         print(f'Downloading {MODELS[name]}')
         print(snapshot_download(MODELS[name]))
 
-def load_model(name):
+def load_model(name, quantization='none'):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(name)
-    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype='auto', device_map='auto')
+    kwargs = {'torch_dtype': 'auto', 'device_map': 'auto'}
+    if quantization == '4bit':
+        if not torch.cuda.is_available():
+            raise RuntimeError('4-bit loading requires a supported CUDA GPU')
+        from transformers import BitsAndBytesConfig
+        kwargs['quantization_config'] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type='nf4',
+            bnb_4bit_compute_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(name, **kwargs)
     model.eval()
     return model, tokenizer
 
@@ -147,9 +156,42 @@ def parse_judge(kind, text):
         raise ValueError(f'Unrecognized WildGuard output: {text!r}')
     return float(match.group(1).lower() == 'yes')
 
+def debug_memory():
+    import torch
+    parts = []
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        parts.append(f'RAM available={mem.available / 2**30:.2f} GiB')
+    except ImportError:
+        pass
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        parts.append(f'GPU={torch.cuda.get_device_name()} free={free / 2**30:.2f}/{total / 2**30:.2f} GiB allocated={torch.cuda.memory_allocated() / 2**30:.2f} GiB')
+    else:
+        parts.append('CUDA unavailable')
+    return '; '.join(parts)
+
+def validate_resume(rows, previous, judge_name, judge_model, quantization):
+    if len(previous) > len(rows):
+        raise ValueError('Output has more records than input')
+    for index, (source, saved) in enumerate(zip(rows, previous)):
+        if any(saved.get(key) != value for key, value in source.items()):
+            raise ValueError(f'Output does not match input row {index}; use a new output file')
+        if judge_name not in saved or saved.get('judge_model') != judge_model or saved.get('judge_quantization') != quantization:
+            raise ValueError(f'Output row {index} has incompatible judge configuration')
+
 def judge(args):
     rows = read_jsonl(args.input)
+    if args.limit is not None:
+        rows = rows[:args.limit]
+    if not rows:
+        raise ValueError('empty input')
+    if Path(args.input).resolve() == Path(args.output).resolve():
+        raise ValueError('Input and output must be different files')
     if args.judge == 'strongreject':
+        if args.quantization != 'none' or args.resume:
+            raise ValueError('--quantization and --resume are currently supported only for WildGuard')
         from datasets import Dataset
         from strong_reject.evaluate import evaluate_dataset
         ds = Dataset.from_list([{'forbidden_prompt': r['goal'], 'response': r['response']} for r in rows])
@@ -158,15 +200,46 @@ def judge(args):
             row['strongreject'] = float(score)
     else:
         import torch
-        model, tok = load_model(args.model or MODELS[args.judge])
-        for row in rows:
-            prompt = WILD_FORMAT.format(prompt=row['prompt'], response=row['response'])
-            inputs = tok(prompt, add_special_tokens=False, return_tensors='pt').to(model.device)
-            with torch.inference_mode():
-                result = model.generate(**inputs, max_new_tokens=128, do_sample=False, pad_token_id=tok.eos_token_id)
-            text = tok.decode(result[0, inputs['input_ids'].shape[-1]:], skip_special_tokens=True)
-            row[args.judge + '_raw'] = text
-            row[args.judge] = parse_judge(args.judge, text)
+        model_name = args.model or MODELS[args.judge]
+        output = Path(args.output)
+        if output.exists() and not args.resume:
+            raise FileExistsError(f'{output} already exists; use --resume or choose a new path')
+        previous = read_jsonl(output) if output.exists() else []
+        validate_resume(rows, previous, args.judge, model_name, args.quantization)
+        print(f'WildGuard: {len(previous)}/{len(rows)} completed; model={model_name}; quantization={args.quantization}', flush=True)
+        print('Before loading:', debug_memory(), flush=True)
+        if len(previous) == len(rows):
+            print('Nothing to do.', flush=True)
+            return
+        model, tok = load_model(model_name, args.quantization)
+        print('Loaded model:', debug_memory(), flush=True)
+        if args.debug:
+            print('Device map:', getattr(model, 'hf_device_map', None), flush=True)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open('a', encoding='utf-8') as f:
+            for index in range(len(previous), len(rows)):
+                row = dict(rows[index])
+                started = time.monotonic()
+                print(f'[{index + 1}/{len(rows)}] id={row.get("id", index)} starting', flush=True)
+                try:
+                    prompt = WILD_FORMAT.format(prompt=row['prompt'], response=row['response'])
+                    inputs = tok(prompt, add_special_tokens=False, return_tensors='pt').to(model.device)
+                    if args.debug:
+                        print(f'  input_tokens={inputs["input_ids"].shape[-1]}; {debug_memory()}', flush=True)
+                    with torch.inference_mode():
+                        result = model.generate(**inputs, max_new_tokens=128, do_sample=False, pad_token_id=tok.eos_token_id)
+                    text = tok.decode(result[0, inputs['input_ids'].shape[-1]:], skip_special_tokens=True)
+                    row['wildguard_raw'] = text
+                    row['wildguard'] = parse_judge('wildguard', text)
+                    row['judge_model'] = model_name
+                    row['judge_quantization'] = args.quantization
+                    f.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + '\n')
+                    f.flush()
+                    print(f'[{index + 1}/{len(rows)}] score={row["wildguard"]:.0f} elapsed={time.monotonic() - started:.1f}s saved={output}', flush=True)
+                except torch.cuda.OutOfMemoryError:
+                    print('CUDA out of memory. Stop other GPU processes or try --quantization 4bit. ' + debug_memory(), file=sys.stderr, flush=True)
+                    raise
+        return
     write_jsonl(args.output, rows)
 
 def summarize(args):
@@ -192,7 +265,12 @@ def main():
     g.add_argument('--min-tokens', type=int, default=75); g.add_argument('--max-tokens', type=int, default=512); g.add_argument('--limit', type=int)
     g.set_defaults(func=generate)
     j = sub.add_parser('judge'); j.add_argument('--input', required=True); j.add_argument('--output', required=True)
-    j.add_argument('--judge', choices=['wildguard', 'strongreject'], required=True); j.add_argument('--model'); j.add_argument('--batch-size', type=int, default=1); j.set_defaults(func=judge)
+    j.add_argument('--judge', choices=['wildguard', 'strongreject'], required=True); j.add_argument('--model'); j.add_argument('--batch-size', type=int, default=1)
+    j.add_argument('--quantization', choices=['none', '4bit'], default='none', help='WildGuard: optional 4-bit NF4; may change scores')
+    j.add_argument('--resume', action='store_true', help='Resume a matching WildGuard output')
+    j.add_argument('--debug', action='store_true', help='Show device map, token count and memory')
+    j.add_argument('--limit', type=int, help='Evaluate only the first N rows')
+    j.set_defaults(func=judge)
     s = sub.add_parser('summarize'); s.add_argument('--input', required=True); s.set_defaults(func=summarize)
     args = p.parse_args(); args.func(args)
 

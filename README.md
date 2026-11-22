@@ -35,6 +35,17 @@ python reproduce.py summarize --input outputs/scored.jsonl
 
 输入的每行至少包含 `id`、`dataset`、`goal`、`prompt`、`setting`。`goal` 是原始有害目标，`prompt` 是实际输入目标模型的固定提示；StrongREJECT 使用 `goal`，安全评审使用实际 `prompt`。请保持不同水印使用同一份提示，并保留模型、数据、依赖版本及完整结果。评审无法解析时程序会报错，避免静默当作安全。
 
+### Colab T4 的 WildGuard 评审
+
+WildGuard 为 7B 模型；在 T4 显存或内存不足时可使用 4-bit NF4 量化。量化会改变评审模型的数值，可能改变判定结果，与论文的全精度评审不完全可比；两组必须使用同样设置。安装适用于当前 PyTorch/CUDA 的 `bitsandbytes` 后运行：
+
+```bash
+pip install bitsandbytes
+python -u reproduce.py judge --input outputs/jbb-none.jsonl --output outputs/jbb-none-wg-4bit.jsonl --judge wildguard --quantization 4bit --debug
+```
+
+每条评分完成后即写入 JSONL，控制台显示样本进度、耗时；`--debug` 额外显示输入长度、设备映射和内存。中断后对同一输入、输出和设置追加 `--resume` 继续；已有文件默认不会覆盖。旧版本的输出不包含恢复所需配置，请使用新文件。`--limit 2` 可先做小规模测试。Colab 运行时重置会删除临时文件，请及时下载。若是在模型加载时进程被系统终止，日志可能没有 Python 异常；释放其他进程或减少内存占用后重试。StrongREJECT 仍使用其官方包，不支持此量化和断点续跑。
+
 ## 绘制结果
 
 将无水印和水印结果传给绘图脚本，输出默认保存在 `outputs/`。输入可以是生成结果，也可以是包含评审结果的 JSONL；两组必须具有相同的样本 ID、模型、目标、提示和实验设置。
