@@ -35,6 +35,16 @@ python reproduce.py summarize --input outputs/scored.jsonl
 
 输入的每行至少包含 `id`、`dataset`、`goal`、`prompt`、`setting`。`goal` 是原始有害目标，`prompt` 是实际输入目标模型的固定提示；StrongREJECT 使用 `goal`，安全评审使用实际 `prompt`。请保持不同水印使用同一份提示，并保留模型、数据、依赖版本及完整结果。评审无法解析时程序会报错，避免静默当作安全。
 
+## 绘制结果
+
+将无水印和水印结果传给绘图脚本，输出默认保存在 `outputs/`。输入可以是生成结果，也可以是包含评审结果的 JSONL；两组必须具有相同的样本 ID、模型、目标、提示和实验设置。
+
+```bash
+python plot_results.py --baseline outputs/jbb-none.jsonl --watermarked outputs/jbb-kgw.jsonl
+```
+
+脚本生成回复字符数对比图 `response_lengths.png`。如果两组都包含 WildGuard 或 StrongREJECT 评分，还会分别生成 `wildguard_asr.png`、`strongreject_score.png` 并打印均值与差值。可使用 `--output-dir` 指定其他目录，例如 Google Drive。回复长度不等于攻击成功率；小样本结果不宜直接与论文比较。
+
 ## 验证
 
 ```bash
