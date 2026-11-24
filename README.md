@@ -63,3 +63,19 @@ python -m unittest discover -s tests
 ```
 
 下载的基准和生成内容可能包含令人不适的文本，应按所在组织的数据处理规则保存。
+
+## JBB 多语言直接提示实验
+
+`multilingual_jbb/translations.jsonl` 固定使用仓库已有 JBB 数据的前 59 条（`jbb-0000` 至 `jbb-0058`），每条包含英文原始目标 `goal`、语言代码和对应语言的 `prompt`。中、日文及前 39 条阿拉伯文由 MyMemory 机器翻译，其余阿拉伯文由助手翻译，均未经独立逐条校对；应在实验前检查翻译是否忠实，尤其是细节和否定语义。原数据上游版本与 SHA-256 见 `reproduce.py` 的 `DATA['jbb']`。这 59 条是顺序截取，类别分布不均，不能当作整个 JBB 的代表性样本。原题目中要求写英文诗的文字也予保留。
+
+实验使用直接请求，未添加越狱模板或水印。基础模型采用原始文本续写，Instruct 模型使用其聊天模板；输入格式的差异可能影响跨模型比较。每种语言使用相同 ID 和逐条种子；不同语言分词不同，并不保证采样轨迹相同。输出可能包含有害内容。
+
+```bash
+# 对 base/instruct 和 en/zh-CN/ja/ar 分别运行，共 8 次；以下为一个例子
+python multilingual_jbb_experiment.py --model instruct --language zh-CN --output outputs/jbb-instruct-zh.jsonl
+python reproduce.py judge --input outputs/jbb-instruct-zh.jsonl --output outputs/jbb-instruct-zh-wg.jsonl --judge wildguard
+# 将 8 个评分文件一起输入（也可先输入部分文件）
+python summarize_multilingual_jbb.py outputs/*-wg.jsonl
+```
+
+WildGuard 的 harmful response 判定均值仅作为近似攻击成功率；它并非针对这四种语言经过验证的等价评审器。应分语言抽样人工核验，特别是中文、日语和阿拉伯语，避免把评审语言偏差当作模型安全差异。基础模型续写不一定遵从请求，指标也需要人工判定是否真正完成目标。未运行实验前不能报告各语言的实际攻击成功率。为避免意外覆盖，生成脚本拒绝覆盖现有输出；中断后请使用新输出文件。请记录模型版本、运行环境和评审配置。
