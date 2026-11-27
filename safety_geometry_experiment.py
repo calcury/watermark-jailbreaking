@@ -97,7 +97,7 @@ def extract(args):
         raise ValueError('model and template token vocabularies must be identical')
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=getattr(torch, args.dtype), local_files_only=args.offline,
-        attn_implementation='eager').to(args.device).eval()
+        attn_implementation='sdpa').to(args.device).eval()
     head = model.get_output_embeddings()
     anchors = english_anchors(rows, tokenizer)
     prompt_states, answer_states = [], []
